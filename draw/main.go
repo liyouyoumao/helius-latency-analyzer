@@ -74,7 +74,7 @@ func main() {
 	})
 
 	p := plot.New()
-	p.Title.Text = "AvgBlockLatency Comparison"
+	p.Title.Text = "Helius Latency Comparison"
 	p.X.Label.Text = "Block"
 	p.Y.Label.Text = "Latency (ms)"
 
@@ -86,7 +86,7 @@ func main() {
 	}
 
 	// 保存为 PNG
-	if err := p.Save(10*vg.Inch, 4*vg.Inch, "latency.png"); err != nil {
+	if err := p.Save(10*vg.Inch, 4*vg.Inch, "metrics.png"); err != nil {
 		panic(err)
 	}
 }
