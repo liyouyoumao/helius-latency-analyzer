@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"runtime"
 	"solgrpc/proto"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/blocto/solana-go-sdk/client"
@@ -30,9 +28,6 @@ const (
 	initialConnWindowSize = 32 * 1024 * 1024  // 32MB
 	maxRecvMsgSize        = 512 * 1024 * 1024 // 512MB
 	maxSendMsgSize        = 512 * 1024 * 1024 // 512MB
-	batchSize             = 128               // Increased batch size
-	prefetchSize          = 256               // Increased prefetch size
-	workerMultiplier      = 8                 // Increased worker multiplier
 )
 
 // zstdCompressor implements the encoding.Compressor interface
@@ -74,57 +69,20 @@ var kacp = keepalive.ClientParameters{
 
 // BlockProcessor handles parallel block processing
 type BlockProcessor struct {
-	workers    int
-	queue      chan *proto.SubscribeUpdateBlock
-	wg         sync.WaitGroup
-	cache      *BlockCache
-	batch      []*proto.SubscribeUpdateBlock
-	batchMu    sync.Mutex
-	prefetch   chan *proto.SubscribeUpdateBlock
-	prefetchWg sync.WaitGroup
-	processed  uint64
-	blockPool  sync.Pool
-	processCh  chan struct{} // Channel to signal processing completion
+	wg        sync.WaitGroup
+	cache     *BlockCache
+	blockPool sync.Pool
 }
 
-func NewBlockProcessor(workers int, cache *BlockCache) *BlockProcessor {
-	if workers <= 0 {
-		workers = runtime.NumCPU() * workerMultiplier
-	}
+func NewBlockProcessor(cache *BlockCache) *BlockProcessor {
 	bp := &BlockProcessor{
-		workers:   workers,
-		queue:     make(chan *proto.SubscribeUpdateBlock, workers*16),
-		cache:     cache,
-		batch:     make([]*proto.SubscribeUpdateBlock, 0, batchSize),
-		prefetch:  make(chan *proto.SubscribeUpdateBlock, prefetchSize),
-		processCh: make(chan struct{}, 1),
+		cache: cache,
 		blockPool: sync.Pool{
 			New: func() interface{} {
 				return &client.Block{}
 			},
 		},
 	}
-
-	// Start prefetch workers
-	for i := 0; i < workers/2; i++ {
-		bp.wg.Add(1)
-		go func() {
-			defer bp.wg.Done()
-			for block := range bp.prefetch {
-				converted := bp.blockPool.Get().(*client.Block)
-				err := convertBlockFast(block, converted)
-				if err != nil {
-					logrus.Errorf("failed to convert block: %v", err)
-					bp.blockPool.Put(converted)
-					continue
-				}
-				bp.cache.AddBlock(int64(block.GetSlot()), converted)
-				atomic.AddUint64(&bp.processed, 1)
-				bp.processCh <- struct{}{}
-			}
-		}()
-	}
-
 	return bp
 }
 
@@ -138,18 +96,6 @@ func (bp *BlockProcessor) Process(block *proto.SubscribeUpdateBlock) {
 		return
 	}
 	bp.cache.AddBlock(int64(block.GetSlot()), converted)
-	atomic.AddUint64(&bp.processed, 1)
-	bp.processCh <- struct{}{}
-}
-
-func (bp *BlockProcessor) Start() {
-	// No need to start workers since we're processing immediately
-}
-
-func (bp *BlockProcessor) Stop() {
-	close(bp.queue)
-	close(bp.prefetch)
-	bp.wg.Wait()
 }
 
 // convertBlockFast is an optimized version of convertBlock that reuses the target block
@@ -204,8 +150,6 @@ func convertBlockFast(block *proto.SubscribeUpdateBlock, target *client.Block) e
 type GrpcClient struct {
 	name      string
 	cache     *BlockCache
-	length    int
-	mux       sync.RWMutex
 	endpoint  string
 	xToken    string
 	conn      *grpc.ClientConn
@@ -220,15 +164,13 @@ func NewGrpcClient(name, endpoint, xToken string, length int) (*GrpcClient, erro
 		endpoint:  endpoint,
 		xToken:    xToken,
 		cache:     cache,
-		processor: NewBlockProcessor(runtime.NumCPU()*workerMultiplier, cache),
+		processor: NewBlockProcessor(cache),
 	}
 
 	// Establish connection immediately
 	if err := gm.connect(); err != nil {
 		return nil, err
 	}
-
-	gm.processor.Start()
 	return gm, nil
 }
 
@@ -348,44 +290,41 @@ func (c *GrpcClient) SubscribeBlock() {
 			if resp == nil || resp.GetBlock() == nil {
 				continue
 			}
+			go func(start time.Time) {
+				networkLat := time.Since(start).Milliseconds()
+				processStart := time.Now()
 
-			networkLat := time.Since(receiveStart).Milliseconds()
-			processStart := time.Now()
+				// Process block using the worker pool
+				c.processor.Process(resp.GetBlock())
 
-			// Process block using the worker pool
-			c.processor.Process(resp.GetBlock())
+				// Wait for processing to complete
+				processLat := time.Since(processStart).Milliseconds()
+				//totalLat := networkLat + processLat
 
-			// Wait for processing to complete
-			<-c.processor.processCh
-			processLat := time.Since(processStart).Milliseconds()
-			//totalLat := networkLat + processLat
+				// Convert block time to milliseconds for consistency
+				blockTimeMs := resp.GetBlock().BlockTime.Timestamp
 
-			// Convert block time to milliseconds for consistency
-			blockTimeMs := resp.GetBlock().BlockTime.Timestamp
+				stats.AddBlockTime(blockTimeMs, networkLat, processLat)
 
-			stats.AddBlockTime(blockTimeMs, networkLat, processLat)
-
-			_, avgTotalLat, avgNetworkLat, _ := stats.GetStats()
-			logrus.WithFields(logrus.Fields{
-				"AvgNetworkLatency": fmt.Sprintf("%.2f", avgNetworkLat),
-				"AvgBlockLatency":   fmt.Sprintf("%.2f", avgTotalLat),
-				"Block":             resp.GetBlock().Slot,
-				"Type":              c.name,
-			}).Info("Metrics")
-			// logrus.Infof("Type: %s, Block %d Metrics:Time Between Blocks: %4d ms,Avg Block Latency: %.2f ms,Avg Network Latency: %.2f ms",
-			// 	c.name,
-			// 	resp.GetBlock().Slot,
-			// 	blockTimeDiff,
-			// 	avgTotalLat,
-			// 	avgNetworkLat)
+				_, avgTotalLat, avgNetworkLat, _ := stats.GetStats()
+				logrus.WithFields(logrus.Fields{
+					"AvgNetworkLatency": fmt.Sprintf("%.2f", avgNetworkLat),
+					"AvgBlockLatency":   fmt.Sprintf("%.2f", avgTotalLat),
+					"Block":             resp.GetBlock().Slot,
+					"Type":              c.name,
+				}).Info("Metrics")
+				// logrus.Infof("Type: %s, Block %d Metrics:Time Between Blocks: %4d ms,Avg Block Latency: %.2f ms,Avg Network Latency: %.2f ms",
+				// 	c.name,
+				// 	resp.GetBlock().Slot,
+				// 	blockTimeDiff,
+				// 	avgTotalLat,
+				// 	avgNetworkLat)
+			}(receiveStart)
 		}
 	}
 }
 
 func (c *GrpcClient) Close() {
-	if c.processor != nil {
-		c.processor.Stop()
-	}
 	if c.conn != nil {
 		c.conn.Close()
 	}

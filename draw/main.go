@@ -38,23 +38,29 @@ func main() {
 		data[m.Block][m.Type] = m
 	}
 
-	dedicatedPoints := make(plotter.XYs, 0)
-	laserPoints := make(plotter.XYs, 0)
+	dAvgBlockLatPoints := make(plotter.XYs, 0)
+	dAvgNetLatPoints := make(plotter.XYs, 0)
+	lAvgBlockLatPoints := make(plotter.XYs, 0)
+	lAvgNetLatPoints := make(plotter.XYs, 0)
 
 	for block, m := range data {
 		if d, ok := m["dedicated"]; ok {
 			lat, _ := strconv.ParseFloat(d.AvgBlockLatency, 64)
-			dedicatedPoints = append(dedicatedPoints, plotter.XY{X: float64(block), Y: lat})
+			dAvgBlockLatPoints = append(dAvgBlockLatPoints, plotter.XY{X: float64(block), Y: lat})
+			lat, _ = strconv.ParseFloat(d.AvgNetworkLatency, 64)
+			dAvgNetLatPoints = append(dAvgNetLatPoints, plotter.XY{X: float64(block), Y: lat})
 		}
 		if l, ok := m["laser"]; ok {
 			lat, err := strconv.ParseFloat(l.AvgBlockLatency, 64)
 			if err != nil {
 				log.Fatal(err)
 			}
-			laserPoints = append(laserPoints, plotter.XY{X: float64(block), Y: lat})
+			lAvgBlockLatPoints = append(lAvgBlockLatPoints, plotter.XY{X: float64(block), Y: lat})
+			lat, _ = strconv.ParseFloat(l.AvgNetworkLatency, 64)
+			lAvgNetLatPoints = append(lAvgNetLatPoints, plotter.XY{X: float64(block), Y: lat})
 		}
 	}
-	slices.SortFunc(dedicatedPoints, func(a plotter.XY, b plotter.XY) int {
+	slices.SortFunc(dAvgBlockLatPoints, func(a plotter.XY, b plotter.XY) int {
 		if a.X < b.X {
 			return -1
 		}
@@ -63,7 +69,25 @@ func main() {
 		}
 		return 0
 	})
-	slices.SortFunc(laserPoints, func(a plotter.XY, b plotter.XY) int {
+	slices.SortFunc(lAvgBlockLatPoints, func(a plotter.XY, b plotter.XY) int {
+		if a.X < b.X {
+			return -1
+		}
+		if a.X > b.X {
+			return 1
+		}
+		return 0
+	})
+	slices.SortFunc(dAvgNetLatPoints, func(a plotter.XY, b plotter.XY) int {
+		if a.X < b.X {
+			return -1
+		}
+		if a.X > b.X {
+			return 1
+		}
+		return 0
+	})
+	slices.SortFunc(lAvgNetLatPoints, func(a plotter.XY, b plotter.XY) int {
 		if a.X < b.X {
 			return -1
 		}
@@ -77,10 +101,13 @@ func main() {
 	p.Title.Text = "Helius Latency Comparison"
 	p.X.Label.Text = "Block"
 	p.Y.Label.Text = "Latency (ms)"
+	p.Legend.Top = true
 
 	err := plotutil.AddLinePoints(p,
-		"Dedicated", dedicatedPoints,
-		"Laser", laserPoints)
+		"D-AvgBlockLatency", dAvgBlockLatPoints,
+		"D-AvgNetkLatency", dAvgNetLatPoints,
+		"L-AvgBlcokLatency", lAvgBlockLatPoints,
+		"L-AvgNetkLatency", lAvgNetLatPoints)
 	if err != nil {
 		panic(err)
 	}
